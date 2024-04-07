@@ -2,7 +2,7 @@ use std::iter::once;
 
 use futures::executor::block_on;
 use log::{debug, error};
-use wgpu::SurfaceConfiguration;
+use wgpu::{include_wgsl, SurfaceConfiguration};
 use winit::{
     dpi::PhysicalSize,
     event::*,
@@ -18,6 +18,7 @@ struct State<'w> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     size: PhysicalSize<u32>,
+    pipeline: wgpu::RenderPipeline,
 }
 
 impl<'w> State<'w> {
@@ -36,7 +37,6 @@ impl<'w> State<'w> {
         debug!("surface: {:?}", surface);
 
         // an adapter is the actual handle to the gpu
-        // this creates the devide and the queue later
         let backends = wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
         debug!("backends: {:?}", backends);
         for adapter in instance.enumerate_adapters(backends) {
@@ -87,6 +87,37 @@ impl<'w> State<'w> {
         // select the default texture view descriptor
         let surface_view_descriptor = wgpu::TextureViewDescriptor::default();
 
+        // load the sample shader
+        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
+
+        // create the render pipeline
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("main render pipeline layout"),
+            ..Default::default()
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("main render pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vert",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "frag",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            multisample: wgpu::MultisampleState::default(),
+            depth_stencil: None,
+            multiview: None,
+        });
+
         Self {
             surface,
             surface_config,
@@ -94,6 +125,7 @@ impl<'w> State<'w> {
             device,
             queue,
             size,
+            pipeline,
         }
     }
 
@@ -144,11 +176,15 @@ impl<'w> State<'w> {
                 },
             };
 
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main render pass"),
                 color_attachments: &[Some(color_attachment)],
                 ..Default::default()
             });
+
+            // example triangle
+            render_pass.set_pipeline(&self.pipeline);
+            render_pass.draw(0..3, 0..1);
         }
 
         self.queue.submit(once(encoder.finish()));
