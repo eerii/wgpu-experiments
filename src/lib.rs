@@ -1,108 +1,110 @@
+use std::iter::once;
+
+use futures::executor::block_on;
+use log::{debug, error};
+use wgpu::SurfaceConfiguration;
 use winit::{
+    dpi::PhysicalSize,
     event::*,
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
-struct State {
-    surface: wgpu::Surface,
+struct State<'w> {
+    surface: wgpu::Surface<'w>,
+    surface_config: wgpu::SurfaceConfiguration,
+    surface_view_descriptor: wgpu::TextureViewDescriptor<'w>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    // The window must be declared after the surface
-    window: Window,
+    size: PhysicalSize<u32>,
 }
 
-impl State {
-    // Creating some of the wgpu types requires async code
-    async fn new(window: Window) -> Self {
+impl<'w> State<'w> {
+    async fn new(window: &'w Window) -> Self {
         let size = window.inner_size();
 
-        // The instance is a handle to the abstract GPU
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // an instance is the first object that wgpu needs to create
+        // it is mainly used to create the surface and adapter
+        let instance = wgpu::Instance::default();
 
-        // This is the part of the window we actually draw to
-        // # Safety
-        // The surface needs to live as long as the window that created it
-        // This should be safe since state owns it
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
+        // a surface is a platform-specific object that is used to present rendered images
+        // to the screen
+        let surface = instance
+            .create_surface(window)
+            .expect("failed to create surface");
+        debug!("surface: {:?}", surface);
 
-        // The adapter is a handle for the actual graphics card
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
+        // an adapter is the actual handle to the gpu
+        // this creates the devide and the queue later
+        let backends = wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
+        debug!("backends: {:?}", backends);
+        for adapter in instance.enumerate_adapters(backends) {
+            let info = adapter.get_info();
+            debug!("adapter: {:?}", info);
+        }
+
+        let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, Some(&surface))
             .await
-            .unwrap();
+            .expect("failed to create adapter");
 
-        // Here we get the device and command queue from our adapter
+        // create the device and the queue
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::empty(),
-                    // WebGL has a lower feature set
-                    limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
+                    // we may request extra features that should be enabled
+                    // devices limit the features they may have, so workarrounds need to be
+                    // provided for unsupported hardware
+                    required_features: wgpu::Features::empty(),
+                    // they describe the limits of each type of resource we can create
+                    required_limits: wgpu::Limits::default(),
                     label: None,
                 },
                 None,
             )
             .await
-            .unwrap();
+            .expect("failed to create device and queue");
 
-        // Get surface capabilities to select the format (sRGB) and other properties
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, // Render to the screen
+        // configure the surface
+        let surface_capabilities = surface.get_capabilities(&adapter);
+        let surface_format = surface_capabilities.formats[0];
+        let surface_config = SurfaceConfiguration {
+            // how will the texture be used
+            // render_attachment specifies that it will be written to the screen
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // how will it be stored on the gpu
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Fifo, // VSync
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
+            // fifo is equivalent to vsync (guaranteed to be supported)
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![surface_format],
+            desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        surface.configure(&device, &surface_config);
 
-        // Create the state
+        // select the default texture view descriptor
+        let surface_view_descriptor = wgpu::TextureViewDescriptor::default();
+
         Self {
-            window,
             surface,
+            surface_config,
+            surface_view_descriptor,
             device,
             queue,
-            config,
             size,
         }
     }
 
-    pub fn window(&self) -> &Window {
-        &self.window
+    fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        self.size = new_size;
+        self.surface_config.width = new_size.width;
+        self.surface_config.height = new_size.height;
+        self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
-
-    fn input(&mut self, _event: &WindowEvent) -> bool {
+    fn input(&mut self, _event: &KeyEvent) -> bool {
         false
     }
 
@@ -111,102 +113,102 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // Get a frame to render to
-        let output = self.surface.get_current_texture()?;
+        // request a frame to render to
+        let frame = self.surface.get_current_texture()?;
 
-        // Create a texture view to control how the render code interacts with the texture
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // get a texture view into the frame
+        let view = frame.texture.create_view(&self.surface_view_descriptor);
 
-        // The encoder builds command buffers to send to the GPU
+        // a command encoder sends the commands to the gpu
+        // we store them in a command buffer before sending
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
+                label: Some("render command encoder"),
             });
 
-        // Create a render pass to handle the actual drawing
+        // create a render pass using the encoder
+        // this has all the methods for drawing
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.9,
-                            g: 0.3,
-                            b: 0.6,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
+            let color_attachment = wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.3,
+                        g: 0.5,
+                        b: 0.9,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main render pass"),
+                color_attachments: &[Some(color_attachment)],
+                ..Default::default()
             });
         }
 
-        // Submit the queue to the GPU and present
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        self.queue.submit(once(encoder.finish()));
+        frame.present();
 
         Ok(())
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-pub async fn run() {
+pub fn run() {
+    // initialize the appropiate logger
     env_logger::init();
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    let mut state = State::new(window).await;
+    // create the main app components
+    let event_loop = EventLoop::new().expect("Failed to create an event loop");
+    let window = WindowBuilder::new()
+        .with_inner_size(PhysicalSize::new(800, 800))
+        .with_title("wgpu experiments")
+        .build(&event_loop)
+        .expect("failed to create a window");
+    debug!("the main window was created");
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window().id() => {
-            if !state.input(event) {
-                match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
-                    }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(**new_inner_size);
-                    }
-                    _ => {}
+    // create the application state
+    let mut state = block_on(State::new(&window));
+
+    // run the application loop
+    event_loop
+        .run(|event, control_flow| match event {
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == window.id() => match event {
+                WindowEvent::Resized(size) => state.resize(*size),
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    state.resize(window.inner_size());
                 }
-            }
-        }
-        Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-            state.update();
-            match state.render() {
-                Ok(_) => {}
-                // Reconfigure the surface if lost
-                Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                // The system is out of memory, we should probably quit
-                Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                // All other errors (Outdated, Timeout) should be resolved by the next frame
-                Err(e) => eprintln!("{:?}", e),
-            }
-        }
-        Event::MainEventsCleared => {
-            state.window().request_redraw();
-        }
-        _ => {}
-    });
+                WindowEvent::CloseRequested => control_flow.exit(),
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if state.input(event) {
+                        window.request_redraw();
+                        return;
+                    }
+                    if event.state.is_pressed() {
+                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                            control_flow.exit();
+                        }
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    state.update();
+                    match state.render() {
+                        Ok(_) => {}
+                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                        Err(wgpu::SurfaceError::OutOfMemory) => control_flow.exit(),
+                        Err(e) => error!("unhandled error {:?}", e),
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        })
+        .expect("failed to start the main application loop");
 }
